@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whatthewafer"
+version = "0.1.0"
+description = "Wafer blob fingerprint identification (LoFTR + DISK/LightGlue)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "kornia>=0.8.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "tifffile>=2023.1.0",
+    "scikit-image>=0.20.0",
+    "h5py>=3.8.0",
+    "faiss-cpu>=1.7.0",
+]
+
+[project.scripts]
+whattw = "wafer_id:main"
+
+[tool.setuptools]
+py-modules = ["wafer_id", "preprocessing", "visualizer", "database"]
+packages   = ["matchers"]

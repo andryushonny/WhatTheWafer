@@ -1,0 +1,21 @@
+# Runtime data — mounted as volumes, must not be baked into the image
+database/
+wafers/
+whatthewafer.egg-info/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Dev artifacts
+*.png
+*.jpg
+*.tif
+*.tiff
+compare_*.png
+.git/
+.claude/
+.gitignore

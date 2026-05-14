@@ -1,0 +1,16 @@
+services:
+  whatthewafer:
+    build: .
+    image: whatthewafer:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./wafers:/app/wafers        # source images (read-only at runtime)
+      - ./database:/app/database    # fingerprint DB persists on the host
+    stdin_open: true
+    tty: true

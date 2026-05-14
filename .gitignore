@@ -1,0 +1,37 @@
+# Runtime data — not part of the codebase
+database/
+wafers/
+models/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Docker export
+*.tar.gz
+*.tar
+
+# Output images
+compare_*.png
+compare_*.jpg
+
+# IDE / OS
+.idea/
+.claude/
+.vscode/
+.DS_Store
+Thumbs.db
