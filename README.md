@@ -5,7 +5,7 @@
 <td align="center"><strong>SILICON WAFER IDENTIFICATION BY UNIQUE BLOB FINGERPRINT</strong></td>
 </tr></table>
 
-Each wafer carries a random droplet of material — a "blob" with a unique interference fringe pattern. The system remembers this pattern and, given a new image, determines which wafer it is and what is recorded about it in the database.
+Each silicon wafer carries a unique feature in the form of a marker blob (which helps ensure proper orientation) in a corner, with a distinctive pattern of interference fringes. The system memorizes this "digital fingerprint" and records it in a database. Subsequently, from a single image, it determines which wafer it is and what data is stored about it in the database.
 
 ```
 whattw query wafer_photo.jpg
