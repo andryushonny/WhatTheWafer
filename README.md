@@ -1,6 +1,9 @@
 # WhatTheWafer
 
-**Silicon wafer identification by the unique blob on its surface.**
+<table border="0"><tr>
+<td><img src="icon.png" width="160" alt="WhatTheWafer logo"/></td>
+<td align="center"><strong>SILICON WAFER IDENTIFICATION BY UNIQUE BLOB FINGERPRINT</strong></td>
+</tr></table>
 
 Each wafer carries a random droplet of material — a "blob" with a unique interference fringe pattern. The system remembers this pattern and, given a new image, determines which wafer it is and what is recorded about it in the database.
 
