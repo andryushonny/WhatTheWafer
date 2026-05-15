@@ -285,10 +285,10 @@ def _show_popup(
             popup, text=note,
             font=("monospace", 13),
             bg=bg, fg="#cccccc",
-            padx=24, pady=(0, 16),
+            padx=24,
             wraplength=_THUMB_SIZE * 2 + 40,
             justify="left",
-        ).pack(fill="x", anchor="w")
+        ).pack(fill="x", anchor="w", pady=(0, 16))
 
     # ── position top-right ────────────────────────────────────────────────────
     popup.update_idletasks()

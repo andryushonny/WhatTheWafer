@@ -2,7 +2,7 @@
 
 ## How it works
 
-The models (LoFTR, DISK, LightGlue) are **fully frozen and never retrained**.
+The models (DISK, LightGlue) are **fully frozen and never retrained**.
 The `add` command runs only forward inference and saves feature vectors to `database/`.
 The `database/` folder is the entire system memory about wafers; model weights never change.
 
