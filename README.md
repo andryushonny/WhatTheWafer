@@ -36,7 +36,7 @@ The system automatically tries all 4 × 90° rotations — if the wafer was phot
 
 ## Examples
 
-**Same wafer photographed in bright-field and dark-field mode** — the blob pattern is clearly matched despite the inverted contrast:
+**Same wafer photographed in bright and dark illumination** — the blob pattern is clearly matched despite the inverted contrast:
 
 ![dark vs bright field](examples/compare_dark_and_bright.png)
 
