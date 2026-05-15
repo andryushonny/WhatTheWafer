@@ -7,6 +7,7 @@ Commands:
   list   List all blobs in the database
   clear  Remove a blob (or the whole DB)
   compare Visually compare two images
+  xval   Random cross-validation / sanity check
 
 Examples:
   python wafer_id.py add wafers/wafer1_1.tif --new wafer1
@@ -19,6 +20,7 @@ Examples:
   python wafer_id.py clear --all
   python wafer_id.py compare wafers/wafer1_1.tif wafers/wafer1_3.tif
   python wafer_id.py compare wafers/wafer1_1.tif wafers/wafer2_1.tif --output out.png
+  python wafer_id.py xval --n 5 --seed 123
 """
 
 import argparse
@@ -41,11 +43,14 @@ _bundled_weights = [
 if all(os.path.isfile(os.path.join(_local_models, w)) for w in _bundled_weights):
     torch.hub.set_dir(_local_models)
 
-from preprocessing import preprocess
+import json
+
+from preprocessing import preprocess, extract_metadata
 from database import BlobDB
 from matchers.disk_lightglue_matcher import DISKLightGlueMatcher
+from crossval import cmd_xval
 
-UNKNOWN_THRESHOLD      = 15    # min RANSAC inliers to claim a positive match
+UNKNOWN_THRESHOLD      = 50    # min RANSAC inliers to claim a positive match
 DEFAULT_DB             = "database"
 ROTATION_ANGLES        = [0, 90, 180, 270]           # coarse cardinal rotations
 FINE_ROTATION_OFFSETS  = [-15, -10, -5, 5, 10, 15]  # degrees around best coarse angle
@@ -303,7 +308,8 @@ def cmd_add(args) -> None:
             proc = cached_procs.get(img_path) or preprocess(img_path)
             rgb, gray = proc["rgb"], proc["gray"]
             print(f"    Cropped shape: {gray.shape[1]}×{gray.shape[0]} px")
-            last_idx = db.add_image(blob_id, img_path, rgb, gray, disk)
+            last_idx = db.add_image(blob_id, img_path, rgb, gray, disk,
+                                    metadata=extract_metadata(img_path))
             n_added += 1
 
     blob  = db.get_blob(blob_id)
@@ -358,9 +364,45 @@ def cmd_list(args) -> None:
         print(f"  {blob_id:<22}  uuid:{short_id}  "
               f"{len(imgs)} view(s),  ~{total_kp} keypoints")
         for img in imgs:
-            src = img.get("source_path", img.get("source", "?"))
-            kp  = img.get("kp_count", "?")
-            print(f"    [{img['img_idx']}]  {src}  (kp={kp})")
+            src     = img.get("source_path", img.get("source", "?"))
+            kp      = img.get("kp_count", "?")
+            ihash   = img.get("image_hash") or ""
+            added   = img.get("added_at") or ""
+            missing = "  [file missing]" if src and not os.path.isfile(src) else ""
+
+            # Format timestamp: "2024-01-15T10:23:45.123+00:00" → "2024-01-15 10:23"
+            if added:
+                added = added[:16].replace("T", " ")
+
+            parts = []
+            if added:
+                parts.append(f"added {added}")
+            parts.append(f"kp={kp}")
+            if ihash:
+                parts.append(f"hash={ihash}")
+            print(f"    [{img['img_idx']}]  {'  ·  '.join(parts)}")
+            print(f"         {src}{missing}")
+
+            # Show metadata fields if present
+            raw_meta = img.get("metadata")
+            if raw_meta:
+                try:
+                    meta = json.loads(raw_meta)
+                except Exception:
+                    meta = {}
+                # Priority display order
+                display_keys = [
+                    "MicroscopeManufacturer", "MicroscopeModel",
+                    "Make", "Model", "Software", "DateTime",
+                    "ObjectiveNominalMagnification", "ObjectiveLensNA",
+                ]
+                shown = {k: meta[k] for k in display_keys if k in meta}
+                # Also show ImageDescription if short enough and nothing else found
+                if not shown and "ImageDescription" in meta:
+                    shown["ImageDescription"] = meta["ImageDescription"][:120]
+                if shown:
+                    line = "  ·  ".join(f"{k}: {v}" for k, v in shown.items())
+                    print(f"         {line}")
     print()
 
 
@@ -511,6 +553,66 @@ def cmd_clear(args) -> None:
         sys.exit("[!] Specify --name NAME, --wafer UUID, or --all.")
 
 
+# ── help ─────────────────────────────────────────────────────────────────────
+
+def cmd_help(_args) -> None:
+    print("""
+WhatTheWafer — wafer blob fingerprint identification (DISK + LightGlue)
+
+  1.  add <image(s)> --new <name>
+      add <image(s)> --wafer <name|uuid>
+        Register a new wafer or add more views to an existing one.
+        Accepts any number of images in a single call.
+        --force    Skip the duplicate-detection prompt.
+
+  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+
+  2.  query <image>
+        Identify an unknown wafer image against the database.
+        --top-k N       Show top-N ranked candidates  (default: 5).
+        --threshold N   Min RANSAC inliers for a positive match  (default: 50).
+        --fine-rotation Also search ±5/10/15° around the best 90°-step angle.
+        --debug         Print per-image inlier scores.
+
+  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+
+  3.  compare <image0> <image1>
+        Visually compare two images side by side and save a PNG report.
+        --output PATH   Output file path  (default: compare_result.png).
+        --fine-rotation Enable fine-rotation search.
+
+  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+
+  4.  list
+        Show all wafers currently in the database with view counts.
+
+  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+
+  5.  clear --name <name>
+      clear --wafer <name|uuid>  [--image N]
+      clear --all
+        Remove a wafer, a single view within it, or wipe the whole database.
+        --yes / -y   Skip the confirmation prompt.
+
+  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+
+  6.  xval
+        Randomly sample images and validate identification accuracy.
+        In-DB images use leave-one-out (temporarily removed, queried, restored).
+        Images that are the only view in their blob are skipped.
+        Ground truth is read from filenames: wafer1_3.tif → expected "wafer1".
+        --wafers-dir DIR   Directory to sample from  (default: wafers/).
+        --n N              Number of images to test  (default: 10).
+        --seed N           Random seed  (default: 42).
+        --threshold N      Same match threshold as query  (default: 50).
+
+GLOBAL FLAGS  (place before the command name)
+  --db DIR     Database directory  (default: database/).
+  --no-gpu     Force CPU inference.
+  --debug      Verbose matching scores.
+""")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -581,9 +683,25 @@ def main() -> None:
     p_clear.add_argument("--yes", "-y", action="store_true",
                          help="Skip confirmation prompt")
 
+    # --- help ---
+    sub.add_parser("help", help="Show command reference and usage examples")
+
+    # --- xval ---
+    p_xval = sub.add_parser("xval",
+                             help="Random cross-validation sanity check")
+    p_xval.add_argument("--wafers-dir", default="wafers", dest="wafers_dir",
+                        help="Directory with wafer images to sample from  (default: wafers)")
+    p_xval.add_argument("--n", type=int, default=10,
+                        help="Number of images to sample  (default: 10)")
+    p_xval.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility  (default: 42)")
+    p_xval.add_argument("--threshold", type=int, default=UNKNOWN_THRESHOLD,
+                        help=f"Min inliers for a positive match  (default: {UNKNOWN_THRESHOLD})")
+
     args = parser.parse_args()
     {"add": cmd_add, "query": cmd_query, "compare": cmd_compare,
-     "list": cmd_list, "clear": cmd_clear}[args.cmd](args)
+     "list": cmd_list, "clear": cmd_clear, "xval": cmd_xval,
+     "help": cmd_help}[args.cmd](args)
 
 
 if __name__ == "__main__":

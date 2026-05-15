@@ -7,10 +7,12 @@ Storage layout (all in db_dir):
   faiss.index    — FAISS ScalarQuantizer(QT_8bit) index over L2-normalised 128-d DISK descriptors
   faiss_map.npy  — int32 array: faiss_vector_id → index into faiss_blob_ids
   faiss_ids.json — ordered list of blob_ids corresponding to faiss_map values
-  <blob_id>/thumb.jpg — representative thumbnail
+  thumbs/<uuid8>.jpg — one thumbnail per image, cropped to keypoint bbox
 """
 
+import hashlib
 import json
+import os
 import sqlite3
 import shutil
 import uuid
@@ -45,6 +47,9 @@ class BlobDB:
         self._fmap_path   = self.db_dir / "faiss_map.npy"
         self._fids_path   = self.db_dir / "faiss_ids.json"
 
+        self._thumbs_dir  = self.db_dir / "thumbs"
+        self._thumbs_dir.mkdir(exist_ok=True)
+
         self._conn = self._init_sqlite()
         self._faiss_index, self._faiss_map, self._faiss_blob_ids = self._load_faiss()
         self._batch_mode = False   # deferred FAISS rebuild flag for batch_add()
@@ -57,6 +62,7 @@ class BlobDB:
         # One-shot HDF5 migrations (order matters: strip LoFTR first, then convert dtype)
         self._migrate_strip_loftr()
         self._migrate_to_float16()
+        self._migrate_thumbs_to_flat()
 
         # Upgrade FAISS index type if the on-disk index is the old IndexFlatL2
         if isinstance(self._faiss_index, faiss.IndexFlat):
@@ -93,6 +99,21 @@ class BlobDB:
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
+
+        # Add image_hash column for content-based lookup (path-independent)
+        try:
+            conn.execute("ALTER TABLE images ADD COLUMN image_hash TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+        # Add per-image addition timestamp and raw metadata JSON
+        for col_def in ("added_at TEXT", "metadata TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE images ADD COLUMN {col_def}")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
         # Assign short_ids to any blobs that don't have one yet
         nulls = conn.execute(
@@ -207,7 +228,10 @@ class BlobDB:
 
     def _h5_save(self, blob_id: str, img_idx: int, disk_feats: dict) -> None:
         with h5py.File(str(self._h5_path), "a") as f:
-            g = f.require_group(self._h5_key(blob_id, img_idx))
+            key = self._h5_key(blob_id, img_idx)
+            if key in f:
+                del f[key]
+            g = f.require_group(key)
             g.create_dataset("disk_kp",     data=disk_feats["keypoints"])
             g.create_dataset("disk_desc",   data=disk_feats["descriptors"].astype(np.float16))
             g.create_dataset("disk_scores", data=disk_feats["scores"])
@@ -255,6 +279,13 @@ class BlobDB:
             "SELECT blob_id FROM blobs WHERE short_id=? OR blob_id=?", (ref, ref)
         ).fetchone()
         return row["blob_id"] if row else None
+
+    def hash_index(self) -> dict[str, tuple[str, int]]:
+        """Return {image_hash: (blob_id, img_idx)} for all images that have a hash stored."""
+        rows = self._conn.execute(
+            "SELECT blob_id, img_idx, image_hash FROM images WHERE image_hash IS NOT NULL"
+        ).fetchall()
+        return {r["image_hash"]: (r["blob_id"], r["img_idx"]) for r in rows}
 
     # ── FAISS fast candidate retrieval ────────────────────────────────────────
 
@@ -306,9 +337,10 @@ class BlobDB:
         rgb: np.ndarray,
         gray: np.ndarray,
         disk_matcher,
+        metadata: dict | None = None,
     ) -> int:
         n = self._conn.execute(
-            "SELECT COUNT(*) FROM images WHERE blob_id=?", (blob_id,)
+            "SELECT COALESCE(MAX(img_idx) + 1, 0) FROM images WHERE blob_id=?", (blob_id,)
         ).fetchone()[0]
 
         if n == 0:
@@ -318,15 +350,16 @@ class BlobDB:
                 " VALUES (?,?,?,?)",
                 (blob_id, blob_id, _now_iso(), short_id),
             )
-            bd = self.db_dir / blob_id
-            bd.mkdir(parents=True, exist_ok=True)
-            thumb_path = str(bd / "thumb.jpg")
-            cv2.imwrite(thumb_path, cv2.cvtColor(_make_thumb(rgb, THUMB_SIZE),
-                                                  cv2.COLOR_RGB2BGR))
-        else:
-            thumb_path = None
 
         disk_feats = disk_matcher.extract(gray)
+
+        thumb_name = uuid.uuid4().hex[:8] + ".jpg"
+        thumb_path = str(self._thumbs_dir / thumb_name)
+        cv2.imwrite(thumb_path, cv2.cvtColor(
+            _make_thumb(rgb, disk_feats["keypoints"], THUMB_SIZE), cv2.COLOR_RGB2BGR
+        ))
+
+        image_hash = hashlib.sha256(rgb.tobytes()).hexdigest()[:16]
 
         self._h5_save(blob_id, n, disk_feats)
 
@@ -334,10 +367,12 @@ class BlobDB:
             self._rebuild_faiss()
 
         self._conn.execute(
-            "INSERT INTO images (blob_id, img_idx, source_path, kp_count, thumb_path)"
-            " VALUES (?,?,?,?,?)",
-            (blob_id, n, str(source_path),
-             int(len(disk_feats["keypoints"])), thumb_path),
+            "INSERT INTO images"
+            " (blob_id, img_idx, source_path, kp_count, thumb_path, image_hash, added_at, metadata)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (blob_id, n, str(os.path.abspath(source_path)),
+             int(len(disk_feats["keypoints"])), thumb_path, image_hash,
+             _now_iso(), json.dumps(metadata or {})),
         )
         self._conn.commit()
         return n
@@ -352,6 +387,13 @@ class BlobDB:
                 key = f"blobs/{blob_id}"
                 if key in f:
                     del f[key]
+        for row in self._conn.execute(
+            "SELECT thumb_path FROM images WHERE blob_id=? AND thumb_path IS NOT NULL",
+            (blob_id,)
+        ).fetchall():
+            p = Path(row["thumb_path"])
+            if p.exists():
+                p.unlink()
         shutil.rmtree(self.db_dir / blob_id, ignore_errors=True)
         self._conn.execute("DELETE FROM images WHERE blob_id=?", (blob_id,))
         self._conn.execute("DELETE FROM blobs  WHERE blob_id=?", (blob_id,))
@@ -373,6 +415,15 @@ class BlobDB:
                 key = self._h5_key(blob_id, img_idx)
                 if key in f:
                     del f[key]
+
+        thumb_row = self._conn.execute(
+            "SELECT thumb_path FROM images WHERE blob_id=? AND img_idx=?",
+            (blob_id, img_idx)
+        ).fetchone()
+        if thumb_row and thumb_row["thumb_path"]:
+            p = Path(thumb_row["thumb_path"])
+            if p.exists():
+                p.unlink()
 
         self._conn.execute(
             "DELETE FROM images WHERE blob_id=? AND img_idx=?", (blob_id, img_idx)
@@ -490,6 +541,42 @@ class BlobDB:
         tmp.replace(self._h5_path)
         print("[+] disk_desc converted to float16")
 
+    def _migrate_thumbs_to_flat(self) -> None:
+        """Move per-blob thumb.jpg files into database/thumbs/<uuid8>.jpg (one-shot)."""
+        rows = self._conn.execute(
+            "SELECT blob_id, img_idx, thumb_path FROM images WHERE thumb_path IS NOT NULL"
+        ).fetchall()
+
+        needs = any(
+            not Path(row["thumb_path"]).parent.name == "thumbs"
+            for row in rows
+            if row["thumb_path"]
+        )
+        if not needs:
+            return
+
+        print("[*] Migrating thumbs → database/thumbs/ ...")
+        for row in rows:
+            old_path = Path(row["thumb_path"])
+            if not old_path.exists():
+                continue
+            new_name = uuid.uuid4().hex[:8] + ".jpg"
+            new_path = self._thumbs_dir / new_name
+            shutil.move(str(old_path), str(new_path))
+            self._conn.execute(
+                "UPDATE images SET thumb_path=? WHERE blob_id=? AND img_idx=?",
+                (str(new_path), row["blob_id"], row["img_idx"]),
+            )
+        self._conn.commit()
+
+        # Remove now-empty blob subdirs
+        for bid in self.blob_ids():
+            blob_dir = self.db_dir / bid
+            if blob_dir.is_dir() and not any(blob_dir.iterdir()):
+                blob_dir.rmdir()
+
+        print("[+] Thumbs migrated to database/thumbs/")
+
     def _migrate_legacy(self, legacy_index: Path) -> None:
         print("[*] Migrating legacy folder-based DB → SQLite + HDF5 + FAISS ...")
         with open(legacy_index) as f:
@@ -537,7 +624,17 @@ class BlobDB:
 
 # ── utils ─────────────────────────────────────────────────────────────────────
 
-def _make_thumb(rgb: np.ndarray, size: int) -> np.ndarray:
+THUMB_PAD = 20   # px padding around keypoint bbox in the thumbnail crop
+
+def _make_thumb(rgb: np.ndarray, keypoints: np.ndarray, size: int) -> np.ndarray:
+    """Crop RGB to keypoint bounding box + padding, then resize to fit in `size`."""
+    H, W = rgb.shape[:2]
+    if len(keypoints) > 0:
+        x0 = max(0,  int(keypoints[:, 0].min()) - THUMB_PAD)
+        y0 = max(0,  int(keypoints[:, 1].min()) - THUMB_PAD)
+        x1 = min(W,  int(keypoints[:, 0].max()) + THUMB_PAD)
+        y1 = min(H,  int(keypoints[:, 1].max()) + THUMB_PAD)
+        rgb = rgb[y0:y1, x0:x1]
     H, W = rgb.shape[:2]
     s = size / max(H, W)
     return cv2.resize(rgb, (max(1, int(W * s)), max(1, int(H * s))),

@@ -11,6 +11,8 @@ Pipeline:
 """
 
 import logging
+import os
+import xml.etree.ElementTree as _ET
 import cv2
 import numpy as np
 import tifffile
@@ -145,6 +147,67 @@ def crop_blob(
     mask_c = mask[y0:y1, x0:x1].copy()
     gray_c = cv2.cvtColor(rgb_c, cv2.COLOR_RGB2GRAY)
     return rgb_c, mask_c, gray_c
+
+
+# ── Metadata extraction ───────────────────────────────────────────────────────
+
+_TIFF_TAGS = {270: "ImageDescription", 271: "Make", 272: "Model",
+              305: "Software", 306: "DateTime"}
+
+
+def extract_metadata(path: str) -> dict:
+    """
+    Extract available metadata from an image file.
+    For TIFF: reads standard tags, ImageJ metadata, and OME instrument info.
+    Returns a flat {str: str} dict suitable for JSON storage.
+    """
+    result: dict[str, str] = {}
+    if os.path.splitext(path)[1].lower() not in {".tif", ".tiff"}:
+        return result
+
+    try:
+        with tifffile.TiffFile(path) as tf:
+            page = tf.pages[0]
+
+            # Standard TIFF tags
+            for code, name in _TIFF_TAGS.items():
+                tag = page.tags.get(code)
+                if tag is not None:
+                    v = str(tag.value).strip()
+                    if v:
+                        result[name] = v[:500]
+
+            # ImageJ metadata (flat scalar values only)
+            if tf.imagej_metadata:
+                for k, v in tf.imagej_metadata.items():
+                    if isinstance(v, (str, int, float, bool)):
+                        sv = str(v).strip()
+                        if sv:
+                            result[f"imagej_{k}"] = sv[:200]
+
+            # OME metadata — extract microscope / objective info from XML
+            if tf.ome_metadata:
+                try:
+                    root = _ET.fromstring(tf.ome_metadata)
+                    ns = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
+                    p = f"{{{ns}}}" if ns else ""
+                    for mic in root.iter(f"{p}Microscope"):
+                        for attr in ("Manufacturer", "Model", "SerialNumber", "Type"):
+                            v = mic.get(attr)
+                            if v:
+                                result[f"Microscope{attr}"] = v
+                    for obj in root.iter(f"{p}Objective"):
+                        for attr in ("Manufacturer", "Model",
+                                     "NominalMagnification", "LensNA"):
+                            v = obj.get(attr)
+                            if v:
+                                result[f"Objective{attr}"] = v
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return result
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
