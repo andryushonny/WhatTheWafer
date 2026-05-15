@@ -683,6 +683,18 @@ def main() -> None:
     p_clear.add_argument("--yes", "-y", action="store_true",
                          help="Skip confirmation prompt")
 
+    # --- daemon ---
+    p_daemon = sub.add_parser("daemon",
+                              help="Run background hotkey daemon (Ctrl+Shift+W to identify)")
+    p_daemon.add_argument("--db", default=argparse.SUPPRESS,
+                          help=f"Database directory  (default: {DEFAULT_DB})")
+    p_daemon.add_argument("--no-gpu", action="store_true", default=argparse.SUPPRESS,
+                          help="Force CPU inference")
+    p_daemon.add_argument("--threshold", type=int, default=UNKNOWN_THRESHOLD,
+                          help=f"Min inliers for a positive match  (default: {UNKNOWN_THRESHOLD})")
+    p_daemon.add_argument("--debug", action="store_true",
+                          help="Save raw screenshot, crop, and mask to /tmp/ on each keypress")
+
     # --- help ---
     sub.add_parser("help", help="Show command reference and usage examples")
 
@@ -699,6 +711,10 @@ def main() -> None:
                         help=f"Min inliers for a positive match  (default: {UNKNOWN_THRESHOLD})")
 
     args = parser.parse_args()
+    if args.cmd == "daemon":
+        from listener import cmd_daemon
+        cmd_daemon(args)
+        return
     {"add": cmd_add, "query": cmd_query, "compare": cmd_compare,
      "list": cmd_list, "clear": cmd_clear, "xval": cmd_xval,
      "help": cmd_help}[args.cmd](args)

@@ -23,5 +23,5 @@ dependencies = [
 whattw = "wafer_id:main"
 
 [tool.setuptools]
-py-modules = ["wafer_id", "preprocessing", "visualizer", "database", "crossval"]
+py-modules = ["wafer_id", "preprocessing", "visualizer", "database", "crossval", "listener"]
 packages   = ["matchers"]

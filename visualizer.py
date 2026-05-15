@@ -6,6 +6,7 @@ Produces a 2-panel PNG:
   Panel 2 — Verdict bar
 """
 
+import os
 import cv2
 import numpy as np
 
@@ -13,7 +14,7 @@ GAP      = 20      # pixels between the two images in each panel
 MARGIN   = 12      # outer margin
 FONT     = cv2.FONT_HERSHEY_SIMPLEX
 
-DISK_THRESHOLD = 15
+DISK_THRESHOLD = 50
 
 
 # ── low-level helpers ─────────────────────────────────────────────────────────
@@ -77,10 +78,19 @@ def _header_bar(width: int, text: str, n_matches: int, n_inliers: int,
     return bar
 
 
+def _image_label(canvas: np.ndarray, x_start: int, width: int,
+                 text: str, bar_h: int = 24) -> None:
+    """Draw a semi-transparent dark label banner at the top of an image section."""
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (x_start, 0), (x_start + width, bar_h), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0, canvas)
+    cv2.putText(canvas, text, (x_start + 6, bar_h - 7),
+                FONT, 0.40, (240, 240, 240), 1, cv2.LINE_AA)
+
+
 def _verdict_bar(width: int, n_disk: int,
                  path0: str = "", path1: str = "",
                  query_rotation: float = 0.0) -> np.ndarray:
-    import os
     name0 = os.path.basename(path0)
     name1 = os.path.basename(path1)
 
@@ -130,7 +140,8 @@ def _ransac_split(
 
 def _panel_disk(rgb0: np.ndarray, rgb1: np.ndarray,
                 feats0: dict, feats1: dict,
-                disk_matcher) -> tuple[np.ndarray, int]:
+                disk_matcher,
+                label0: str = "", label1: str = "") -> tuple[np.ndarray, int]:
     import torch
 
     def _t(arr):
@@ -160,6 +171,11 @@ def _panel_disk(rgb0: np.ndarray, rgb1: np.ndarray,
     non_kps1 = all_kps1[~inlier_mask]
 
     canvas, x1 = _side_by_side(rgb0, rgb1)
+
+    if label0:
+        _image_label(canvas, 0, rgb0.shape[1], label0)
+    if label1:
+        _image_label(canvas, x1, rgb1.shape[1], label1)
 
     MAX_DISPLAY = 400
     rng = np.random.default_rng(0)
@@ -209,7 +225,12 @@ def build_comparison(
     rgb1/feats1 should already be pre-rotated to the optimal orientation.
     Returns (canvas_bgr, n_inliers) — canvas is ready for cv2.imwrite.
     """
-    panel_disk, n_disk = _panel_disk(rgb0, rgb1, feats0, feats1, disk_matcher)
+    label0 = os.path.basename(path0) if path0 else ""
+    rot_suffix = f"  ({query_rotation:+.0f}°)" if query_rotation != 0 else ""
+    label1 = (os.path.basename(path1) + rot_suffix) if path1 else rot_suffix.strip()
+
+    panel_disk, n_disk = _panel_disk(rgb0, rgb1, feats0, feats1, disk_matcher,
+                                     label0=label0, label1=label1)
 
     verdict = _verdict_bar(panel_disk.shape[1], n_disk, path0, path1, query_rotation)
     sep     = np.full((3, panel_disk.shape[1], 3), (180, 180, 180), dtype=np.uint8)
