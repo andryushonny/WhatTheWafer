@@ -223,7 +223,14 @@ def preprocess(path: str, max_side: int = MAX_SIDE) -> dict:
       source str      — original path
     """
     rgb = load_image(str(path))
+    return preprocess_array(rgb, max_side=max_side, source=str(path))
+
+
+def preprocess_array(
+    rgb: np.ndarray, max_side: int = MAX_SIDE, source: str = ""
+) -> dict:
+    """Same as preprocess() but accepts an already-loaded RGB uint8 array."""
     rgb = resize_max(rgb, max_side)
     mask = segment_blob(rgb)
     rgb_c, mask_c, gray_c = crop_blob(rgb, mask)
-    return {"rgb": rgb_c, "gray": gray_c, "mask": mask_c, "source": str(path)}
+    return {"rgb": rgb_c, "gray": gray_c, "mask": mask_c, "source": source}

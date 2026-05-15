@@ -146,6 +146,55 @@ whattw compare <image1> <image2> --output result.png
 whattw list
 ```
 
+Shows each wafer with its short ID, view count, keypoint count, and note (if set).
+
+### `memory` — add or update a note for a wafer
+
+```bash
+whattw memory <name|uuid|blob_id> "short note about this wafer"
+whattw memory sample_42 ""   # clear the note
+```
+
+The note is displayed in `list` and in the daemon popup when the wafer is identified.
+Accepts wafer name, 4-char short UUID, or full blob ID.
+
+### `daemon` — background hotkey daemon
+
+```bash
+whattw daemon
+whattw daemon --threshold 60
+```
+
+Runs a background process that listens for **Ctrl+Shift+F9**.
+
+**Workflow:**
+1. Take a screenshot with your OS tool (PrtSc / region select on Linux; PrtSc / Win+Shift+S on Windows)
+2. Press **Ctrl+Shift+F9** — the daemon reads the clipboard, identifies the wafer and shows a popup in the top-right corner with:
+   - The query crop (auto-rotated to match the database orientation)
+   - The database thumbnail side by side
+   - The wafer note below the images (if set)
+
+The popup stays on screen until you press **Escape**, click on it, or press **Ctrl+Shift+F9** again (which also starts a new identification).
+
+Models are loaded once at startup (~10 s); all subsequent identifications are instant.
+
+| Flag | Description |
+|---|---|
+| `--threshold N` | Minimum inlier count for a confident match (default: 50) |
+| `--no-gpu` | Force CPU inference |
+| `--debug` | Save intermediate crops and masks to the system temp directory |
+
+**Linux note:** the daemon reads `/dev/input` directly via `evdev` (works on both Wayland and X11). If you see a permission error, fix it with one of:
+```bash
+# Option A — this session only:
+sudo whattw daemon
+
+# Option B — permanent (requires one re-login):
+sudo usermod -aG input $USER
+```
+
+**Windows note:** uses `pynput` — no extra setup required.
+
 ### `clear` — remove from the database
 
 ```bash
@@ -236,6 +285,7 @@ WhatTheWafer/
 ├── wafer_id.py          — entry point, CLI
 ├── preprocessing.py     — image loading and blob segmentation
 ├── database.py          — storage (SQLite + HDF5 + FAISS)
+├── listener.py          — background hotkey daemon (whattw daemon)
 ├── visualizer.py        — match visualization
 ├── matchers/
 │   └── disk_lightglue_matcher.py — DISK + LightGlue matcher

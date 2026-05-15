@@ -348,6 +348,17 @@ def cmd_query(args) -> None:
 
 # ── list ──────────────────────────────────────────────────────────────────────
 
+def cmd_memory(args) -> None:
+    db = BlobDB(args.db)
+    if not db.set_note(args.ref, args.note):
+        print(f"[!] Wafer '{args.ref}' not found.")
+        return
+    if args.note.strip():
+        print(f"[+] Note saved for '{args.ref}'.")
+    else:
+        print(f"[+] Note cleared for '{args.ref}'.")
+
+
 def cmd_list(args) -> None:
     db = BlobDB(args.db)
     blobs = db.blob_ids()
@@ -361,8 +372,10 @@ def cmd_list(args) -> None:
         imgs    = blob["images"]
         short_id = blob.get("short_id", "????????")
         total_kp = sum(img.get("kp_count", 0) for img in imgs)
+        notes    = blob.get("notes") or ""
+        notes_col = f"  | {notes}" if notes else ""
         print(f"  {blob_id:<22}  uuid:{short_id}  "
-              f"{len(imgs)} view(s),  ~{total_kp} keypoints")
+              f"{len(imgs)} view(s),  ~{total_kp} keypoints{notes_col}")
         for img in imgs:
             src     = img.get("source_path", img.get("source", "?"))
             kp      = img.get("kp_count", "?")
@@ -670,6 +683,11 @@ def main() -> None:
     # --- list ---
     sub.add_parser("list", help="List all blobs in the DB")
 
+    # --- memory ---
+    p_memory = sub.add_parser("memory", help="Add/update a short note for a wafer")
+    p_memory.add_argument("ref",  help="Wafer name, short ID, or blob ID")
+    p_memory.add_argument("note", help="Short note text (empty string clears the note)")
+
     # --- clear ---
     p_clear = sub.add_parser("clear", help="Remove blob(s) from the DB")
     p_clear.add_argument("--name",
@@ -716,7 +734,7 @@ def main() -> None:
         cmd_daemon(args)
         return
     {"add": cmd_add, "query": cmd_query, "compare": cmd_compare,
-     "list": cmd_list, "clear": cmd_clear, "xval": cmd_xval,
+     "list": cmd_list, "clear": cmd_clear, "xval": cmd_xval, "memory": cmd_memory,
      "help": cmd_help}[args.cmd](args)
 
 

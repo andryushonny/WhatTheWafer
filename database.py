@@ -115,6 +115,13 @@ class BlobDB:
             except sqlite3.OperationalError:
                 pass  # column already exists
 
+        # Add user notes for blobs
+        try:
+            conn.execute("ALTER TABLE blobs ADD COLUMN notes TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
         # Assign short_ids to any blobs that don't have one yet
         nulls = conn.execute(
             "SELECT blob_id FROM blobs WHERE short_id IS NULL"
@@ -270,15 +277,27 @@ class BlobDB:
             "SELECT * FROM images WHERE blob_id=? ORDER BY img_idx", (blob_id,)
         ).fetchall()
         return {"name": row["name"], "added_at": row["added_at"],
-                "short_id": row["short_id"],
+                "short_id": row["short_id"], "notes": row["notes"],
                 "images": [dict(i) for i in imgs]}
 
     def resolve_blob_id(self, ref: str) -> str | None:
-        """Return blob_id for a given short UUID or wafer name, or None if not found."""
+        """Return blob_id for a given short UUID, blob_id, or wafer name."""
         row = self._conn.execute(
-            "SELECT blob_id FROM blobs WHERE short_id=? OR blob_id=?", (ref, ref)
+            "SELECT blob_id FROM blobs WHERE short_id=? OR blob_id=? OR name=?",
+            (ref, ref, ref),
         ).fetchone()
         return row["blob_id"] if row else None
+
+    def set_note(self, ref: str, note: str) -> bool:
+        """Set or replace the note for a wafer. Returns False if wafer not found."""
+        blob_id = self.resolve_blob_id(ref)
+        if blob_id is None:
+            return False
+        self._conn.execute(
+            "UPDATE blobs SET notes=? WHERE blob_id=?", (note.strip() or None, blob_id)
+        )
+        self._conn.commit()
+        return True
 
     def hash_index(self) -> dict[str, tuple[str, int]]:
         """Return {image_hash: (blob_id, img_idx)} for all images that have a hash stored."""

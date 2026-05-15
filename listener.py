@@ -29,7 +29,7 @@ import numpy as np
 import tkinter as tk
 
 from database import BlobDB
-from preprocessing import preprocess
+from preprocessing import preprocess, preprocess_array
 
 HOTKEY_DISPLAY  = "Ctrl+Shift+F9"
 _HOTKEY_PYNPUT  = "<ctrl>+<shift>+<f9>"
@@ -124,35 +124,29 @@ def _identify(
     """
     from wafer_id import run_matching
 
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp = f.name
-    try:
-        cv2.imwrite(tmp, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        proc = preprocess(tmp)
-        query_crop = proc["rgb"]
+    proc = preprocess_array(rgb)
+    query_crop = proc["rgb"]
 
-        if debug:
-            import time
-            ts = int(time.time())
-            tmp_dir = tempfile.gettempdir()
-            crop_path = os.path.join(tmp_dir, f"wtw_crop_{ts}.png")
-            cv2.imwrite(crop_path, cv2.cvtColor(query_crop, cv2.COLOR_RGB2BGR))
-            mask_path = os.path.join(tmp_dir, f"wtw_mask_{ts}.png")
-            cv2.imwrite(mask_path, proc["mask"])
-            g = proc["gray"]
-            print(f"  [dbg] crop → {crop_path}  ({g.shape[1]}×{g.shape[0]})")
-            print(f"  [dbg] mask → {mask_path}")
+    if debug:
+        import time
+        ts = int(time.time())
+        tmp_dir = tempfile.gettempdir()
+        crop_path = os.path.join(tmp_dir, f"wtw_crop_{ts}.png")
+        cv2.imwrite(crop_path, cv2.cvtColor(query_crop, cv2.COLOR_RGB2BGR))
+        mask_path = os.path.join(tmp_dir, f"wtw_mask_{ts}.png")
+        cv2.imwrite(mask_path, proc["mask"])
+        g = proc["gray"]
+        print(f"  [dbg] crop → {crop_path}  ({g.shape[1]}×{g.shape[0]})")
+        print(f"  [dbg] mask → {mask_path}")
 
-        scores = run_matching(proc["gray"], db, matcher)
-        if not scores:
-            return None
+    scores = run_matching(proc["gray"], db, matcher)
+    if not scores:
+        return None
 
-        blob_id, inliers, best_angle = scores[0]
-        query_crop = _rotate_rgb(query_crop, best_angle)
-        ref_rgb = _load_ref_rgb(db, blob_id)
-        return blob_id, inliers, ref_rgb, query_crop
-    finally:
-        os.unlink(tmp)
+    blob_id, inliers, best_angle = scores[0]
+    query_crop = _rotate_rgb(query_crop, best_angle)
+    ref_rgb = _load_ref_rgb(db, blob_id)
+    return blob_id, inliers, ref_rgb, query_crop
 
 
 def _load_ref_rgb(db: BlobDB, blob_id: str) -> np.ndarray | None:
@@ -224,6 +218,7 @@ def _show_popup(
     root: tk.Tk,
     result: tuple[str, int, np.ndarray | None, np.ndarray] | None,
     threshold: int,
+    note: str | None = None,
 ) -> tk.Toplevel:
     """Render an always-on-top result popup with query + DB thumbnail side by side."""
     popup = tk.Toplevel(root)
@@ -283,6 +278,17 @@ def _show_popup(
                 lbl_d.pack()
                 tk.Label(d_col, text="Database", font=("monospace", 11),
                          bg=bg, fg="#888888").pack()
+
+    # ── note row ──────────────────────────────────────────────────────────────
+    if note:
+        tk.Label(
+            popup, text=note,
+            font=("monospace", 13),
+            bg=bg, fg="#cccccc",
+            padx=24, pady=(0, 16),
+            wraplength=_THUMB_SIZE * 2 + 40,
+            justify="left",
+        ).pack(fill="x", anchor="w")
 
     # ── position top-right ────────────────────────────────────────────────────
     popup.update_idletasks()
@@ -392,7 +398,14 @@ def cmd_daemon(args) -> None:
     root = tk.Tk()
     root.withdraw()
 
-    state: dict = {"matcher": None, "db": None, "busy": False, "popup": None}
+    print("[*] Loading DISK+LightGlue (~10 s)...")
+    from wafer_id import _load_matcher, _device
+    device = _device(getattr(args, "no_gpu", False))
+    matcher = _load_matcher(device, verbose=False)
+    db = BlobDB(args.db)
+    print("[*] Models ready.\n")
+
+    state: dict = {"matcher": matcher, "db": db, "busy": False, "popup": None}
     lock = threading.Lock()
     debug: bool = getattr(args, "debug", False)
 
@@ -402,14 +415,6 @@ def cmd_daemon(args) -> None:
                 return
             state["busy"] = True
         try:
-            if state["matcher"] is None:
-                print("[*] First run — loading DISK+LightGlue (~10 s)...")
-                from wafer_id import _load_matcher, _device
-                device = _device(getattr(args, "no_gpu", False))
-                state["matcher"] = _load_matcher(device, verbose=False)
-                state["db"] = BlobDB(args.db)
-                print("[*] Models ready.\n")
-
             rgb = _get_image()
 
             if debug:
@@ -421,21 +426,35 @@ def cmd_daemon(args) -> None:
 
             result = _identify(rgb, state["db"], state["matcher"], debug=debug)
 
-            def show(r=result):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+            note: str | None = None
+            if result:
+                blob_id, inliers, _, _ = result
+                blob = state["db"].get_blob(blob_id)
+                note = blob.get("notes") if blob else None
+
+            def show(r=result, n=note):
                 p = state["popup"]
                 if p is not None:
                     try:
                         p.destroy()
                     except Exception:
                         pass
-                state["popup"] = _show_popup(root, r, args.threshold)
+                state["popup"] = _show_popup(root, r, args.threshold, note=n)
 
             root.after(0, show)
 
             if result:
                 blob_id, inliers, _, _ = result
                 mark = "[+]" if inliers >= args.threshold else "[?]"
-                print(f"  {mark}  {blob_id}  ({inliers} inliers)")
+                note_str = f"  — {note}" if note else ""
+                print(f"  {mark}  {blob_id}  ({inliers} inliers){note_str}")
             else:
                 print("  ?  No match")
         except Exception as exc:
@@ -458,7 +477,7 @@ def cmd_daemon(args) -> None:
 
     signal.signal(signal.SIGINT, _stop)
 
-    print(f"[*] WhatTheWafer daemon running — hotkey: {HOTKEY_DISPLAY}")
+    print(f"[*] Daemon running — hotkey: {HOTKEY_DISPLAY}")
     print(f"    Database : {args.db}")
     print(f"    Threshold: {args.threshold} inliers")
     print(f"    Workflow : screenshot → clipboard → {HOTKEY_DISPLAY} → popup")

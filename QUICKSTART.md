@@ -39,7 +39,7 @@ All four 90° rotations are tried automatically.
   2     wafer3                         17          0°
   3     wafer2                         10        +90°
 
-[✓] MATCH → 'wafer1'  (5499 inliers)
+[+] MATCH → 'wafer1'  (5499 inliers)
 ```
 
 ### 3. Visual comparison
@@ -48,17 +48,45 @@ All four 90° rotations are tried automatically.
 whattw compare wafers/wafer1_1.tif wafers/unknown.tif -o result.png
 ```
 
-Produces a 3-panel PNG: DISK+LightGlue matches, LoFTR matches, verdict bar.  
+Produces a side-by-side PNG with all LightGlue matches (grey) and RANSAC inliers (green).  
 The second image is auto-rotated to align with the first.
 
 ### 4. Manage the database
 
 ```bash
-whattw list                            # show all wafers with UUIDs and view counts
+whattw list                            # show all wafers with UUIDs, view counts and notes
 whattw clear --wafer wafer1            # remove one wafer (by name or 4-char UUID)
 whattw clear --wafer wafer1 --image 1  # remove a single view (index from list)
 whattw clear --all                     # wipe everything
 ```
+
+### 5. Add notes to wafers
+
+```bash
+whattw memory wafer1 "batch B, March 2025, bright-field only"
+whattw memory wafer1 ""    # clear the note
+```
+
+Notes appear in `whattw list` and in the daemon popup when the wafer is identified.
+
+### 6. Background daemon (hotkey identification)
+
+```bash
+whattw daemon
+```
+
+Loads models once (~10 s), then stays in the background listening for **Ctrl+Shift+F9**.
+
+**Workflow:**
+1. Take a screenshot with your OS tool (PrtSc / region select)
+2. Press **Ctrl+Shift+F9**
+3. A popup appears in the top-right corner showing the result, query crop, and database thumbnail side by side
+
+Close the popup with **Escape**, a click, or press **Ctrl+Shift+F9** again (triggers a new identification).  
+Stop the daemon with **Ctrl+C**.
+
+> **Linux:** requires read access to `/dev/input`. Run with `sudo`, or add yourself to the `input` group: `sudo usermod -aG input $USER` (re-login required).  
+> **Windows:** works out of the box via `pynput`.
 
 ---
 
@@ -77,19 +105,23 @@ whattw clear --all                     # wipe everything
 ## Key options
 
 ```
-add     --new NAME                           (create new wafer)
-        --wafer NAME|UUID                    (add view to existing wafer)
-        --matcher      disk | loftr | both   (duplicate check, default: disk)
-        --force                              (skip duplicate warning)
+add     --new NAME                  create new wafer
+        --wafer NAME|UUID           add view to existing wafer
+        --force                     skip duplicate warning
 
-query   --matcher      loftr | disk | both   (default: both)
-        --top-k        N                     (default: 5)
-        --threshold    N                     (min inliers, default: 15)
-        --fine-rotation                      (also search ±5/10/15°)
-        --debug                              (verbose per-image scores)
+query   --top-k N                   default: 5
+        --threshold N               min inliers for positive match (default: 50)
+        --fine-rotation             also search ±5/10/15°
+        --debug                     verbose per-image scores
 
-compare --output PATH                        (default: compare_result.png)
+compare --output PATH               default: compare_result.png
         --fine-rotation
 
-Global  --no-gpu                             (force CPU inference)
+memory  <name|uuid> "note"          set wafer note (empty string clears it)
+
+daemon  --threshold N               default: 50
+        --no-gpu                    force CPU inference
+        --debug                     save intermediate crops to temp dir
+
+Global  --no-gpu                    force CPU inference
 ```
