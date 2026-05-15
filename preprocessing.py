@@ -129,7 +129,7 @@ def crop_blob(
     ys, xs = np.where(mask > 0)
 
     if len(xs) == 0:
-        gray = cv2.cvtColor(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         return rgb.copy(), mask.copy(), gray
 
     x0, x1 = int(xs.min()), int(xs.max())
@@ -143,7 +143,7 @@ def crop_blob(
 
     rgb_c  = rgb[y0:y1, x0:x1].copy()
     mask_c = mask[y0:y1, x0:x1].copy()
-    gray_c = cv2.cvtColor(cv2.cvtColor(rgb_c, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
+    gray_c = cv2.cvtColor(rgb_c, cv2.COLOR_RGB2GRAY)
     return rgb_c, mask_c, gray_c
 
 

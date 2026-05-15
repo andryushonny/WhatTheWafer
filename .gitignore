@@ -25,9 +25,14 @@ env/
 *.tar.gz
 *.tar
 
-# Output images
+# Output images (root-level only; examples/ is intentionally tracked)
 compare_*.png
 compare_*.jpg
+!examples/*.png
+!examples/*.jpg
+
+# Test images
+wafer*.jpg 
 
 # IDE / OS
 .idea/

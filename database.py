@@ -4,7 +4,7 @@ database.py — Blob fingerprint database.
 Storage layout (all in db_dir):
   index.sqlite   — metadata: blobs + images tables
   features.h5    — all feature arrays, keyed by blobs/<blob_id>/<NNN>/
-  faiss.index    — FAISS FlatL2 index over L2-normalised 128-d DISK descriptors
+  faiss.index    — FAISS ScalarQuantizer(QT_8bit) index over L2-normalised 128-d DISK descriptors
   faiss_map.npy  — int32 array: faiss_vector_id → index into faiss_blob_ids
   faiss_ids.json — ordered list of blob_ids corresponding to faiss_map values
   <blob_id>/thumb.jpg — representative thumbnail
@@ -14,6 +14,7 @@ import json
 import sqlite3
 import shutil
 import uuid
+from contextlib import contextmanager
 import cv2
 import numpy as np
 import h5py
@@ -46,14 +47,21 @@ class BlobDB:
 
         self._conn = self._init_sqlite()
         self._faiss_index, self._faiss_map, self._faiss_blob_ids = self._load_faiss()
+        self._batch_mode = False   # deferred FAISS rebuild flag for batch_add()
 
         # One-shot migration from the old folder-based format
         legacy = self.db_dir / "index.json"
         if legacy.exists():
             self._migrate_legacy(legacy)
 
-        # One-shot migration: strip loftr_gray from existing HDF5 data
+        # One-shot HDF5 migrations (order matters: strip LoFTR first, then convert dtype)
         self._migrate_strip_loftr()
+        self._migrate_to_float16()
+
+        # Upgrade FAISS index type if the on-disk index is the old IndexFlatL2
+        if isinstance(self._faiss_index, faiss.IndexFlat):
+            print("[*] Upgrading FAISS: FlatL2 → ScalarQuantizer(QT_8bit) ...")
+            self._rebuild_faiss()
 
     # ── SQLite ────────────────────────────────────────────────────────────────
 
@@ -120,7 +128,9 @@ class BlobDB:
             fids  = json.loads(self._fids_path.read_text()) \
                     if self._fids_path.exists() else []
         else:
-            index = faiss.IndexFlatL2(128)
+            index = faiss.IndexScalarQuantizer(
+                128, faiss.ScalarQuantizer.QT_8bit, faiss.METRIC_L2
+            )
             fmap  = np.array([], dtype=np.int32)
             fids  = []
         return index, fmap, fids
@@ -130,31 +140,64 @@ class BlobDB:
         np.save(str(self._fmap_path), self._faiss_map)
         self._fids_path.write_text(json.dumps(self._faiss_blob_ids))
 
+    @contextmanager
+    def batch_add(self):
+        """Defer FAISS rebuild until all add_image() calls complete.
+
+        Use when adding multiple images to avoid rebuilding the index on every
+        add — the index is rebuilt exactly once when the context exits.
+
+        Example::
+
+            with db.batch_add():
+                for path in image_paths:
+                    db.add_image(blob_id, path, rgb, gray, disk)
+        """
+        self._batch_mode = True
+        try:
+            yield self
+        finally:
+            self._batch_mode = False
+            self._rebuild_faiss()
+
     def _rebuild_faiss(self) -> None:
-        """Rebuild FAISS from scratch (called after blob removal)."""
-        self._faiss_index    = faiss.IndexFlatL2(128)
+        """Rebuild FAISS ScalarQuantizer index from scratch."""
         self._faiss_map      = np.array([], dtype=np.int32)
         self._faiss_blob_ids = []
+        sq = faiss.IndexScalarQuantizer(
+            128, faiss.ScalarQuantizer.QT_8bit, faiss.METRIC_L2
+        )
+
         if not self._h5_path.exists():
+            self._faiss_index = sq
             self._save_faiss()
             return
+
+        all_descs: list[np.ndarray] = []
+        blob_map:  list[int]        = []
+
         with h5py.File(str(self._h5_path), "r") as f:
             for blob_id in f.get("blobs", {}).keys():
                 blob_idx = len(self._faiss_blob_ids)
                 self._faiss_blob_ids.append(blob_id)
                 for img_key in f["blobs"][blob_id].keys():
-                    descs = f["blobs"][blob_id][img_key]["disk_desc"][:]
-                    self._faiss_add(descs, blob_idx)
-        self._save_faiss()
+                    raw = f["blobs"][blob_id][img_key]["disk_desc"][:].astype(np.float32)
+                    norms = np.linalg.norm(raw, axis=1, keepdims=True)
+                    d = raw / (norms + 1e-6)
+                    all_descs.append(d)
+                    blob_map.extend([blob_idx] * len(d))
 
-    def _faiss_add(self, descs: np.ndarray, blob_idx: int) -> None:
-        d = descs.astype(np.float32)
-        norms = np.linalg.norm(d, axis=1, keepdims=True)
-        d /= norms + 1e-6
-        self._faiss_index.add(d)
-        self._faiss_map = np.concatenate(
-            [self._faiss_map, np.full(len(d), blob_idx, dtype=np.int32)]
-        )
+        if not all_descs:
+            self._faiss_index = sq
+            self._save_faiss()
+            return
+
+        all_vecs = np.vstack(all_descs)
+        self._faiss_map = np.array(blob_map, dtype=np.int32)
+        sq.train(all_vecs)
+        sq.add(all_vecs)
+        self._faiss_index = sq
+        self._save_faiss()
 
     # ── HDF5 ──────────────────────────────────────────────────────────────────
 
@@ -166,7 +209,7 @@ class BlobDB:
         with h5py.File(str(self._h5_path), "a") as f:
             g = f.require_group(self._h5_key(blob_id, img_idx))
             g.create_dataset("disk_kp",     data=disk_feats["keypoints"])
-            g.create_dataset("disk_desc",   data=disk_feats["descriptors"], compression="lzf")
+            g.create_dataset("disk_desc",   data=disk_feats["descriptors"].astype(np.float16))
             g.create_dataset("disk_scores", data=disk_feats["scores"])
             g.attrs["hw"] = disk_feats["hw"]
 
@@ -179,7 +222,7 @@ class BlobDB:
             return {
                 "disk": {
                     "keypoints":   g["disk_kp"][:],
-                    "descriptors": g["disk_desc"][:],
+                    "descriptors": g["disk_desc"][:].astype(np.float32),
                     "scores":      g["disk_scores"][:],
                     "hw":          tuple(int(x) for x in g.attrs["hw"]),
                 },
@@ -287,13 +330,8 @@ class BlobDB:
 
         self._h5_save(blob_id, n, disk_feats)
 
-        if blob_id not in self._faiss_blob_ids:
-            blob_idx = len(self._faiss_blob_ids)
-            self._faiss_blob_ids.append(blob_id)
-        else:
-            blob_idx = self._faiss_blob_ids.index(blob_id)
-        self._faiss_add(disk_feats["descriptors"], blob_idx)
-        self._save_faiss()
+        if not self._batch_mode:
+            self._rebuild_faiss()
 
         self._conn.execute(
             "INSERT INTO images (blob_id, img_idx, source_path, kp_count, thumb_path)"
@@ -362,7 +400,9 @@ class BlobDB:
         for item in self.db_dir.iterdir():
             if item.is_dir():
                 shutil.rmtree(item)
-        self._faiss_index    = faiss.IndexFlatL2(128)
+        self._faiss_index    = faiss.IndexScalarQuantizer(
+            128, faiss.ScalarQuantizer.QT_8bit, faiss.METRIC_L2
+        )
         self._faiss_map      = np.array([], dtype=np.int32)
         self._faiss_blob_ids = []
 
@@ -416,6 +456,40 @@ class BlobDB:
         tmp.replace(self._h5_path)
         print("[+] LoFTR data removed from features.h5")
 
+    def _migrate_to_float16(self) -> None:
+        """Convert disk_desc datasets from float32 to float16 (one-shot)."""
+        if not self._h5_path.exists():
+            return
+        with h5py.File(str(self._h5_path), "r") as f:
+            needs = any(
+                "disk_desc" in f["blobs"][bid][ikey]
+                and f["blobs"][bid][ikey]["disk_desc"].dtype == np.float32
+                for bid in f.get("blobs", {})
+                for ikey in f["blobs"][bid]
+            )
+        if not needs:
+            return
+        print("[*] Migrating DB: converting disk_desc to float16 ...")
+        tmp = self._h5_path.with_suffix(".h5.tmp")
+        with h5py.File(str(self._h5_path), "r") as src, \
+             h5py.File(str(tmp), "w") as dst:
+            for blob_id in src.get("blobs", {}).keys():
+                for img_key in src["blobs"][blob_id].keys():
+                    src_g = src[f"blobs/{blob_id}/{img_key}"]
+                    dst_g = dst.require_group(f"blobs/{blob_id}/{img_key}")
+                    for key in src_g.keys():
+                        if key == "disk_desc":
+                            dst_g.create_dataset(
+                                "disk_desc",
+                                data=src_g["disk_desc"][:].astype(np.float16),
+                            )
+                        else:
+                            src.copy(f"blobs/{blob_id}/{img_key}/{key}", dst_g, name=key)
+                    for k, v in src_g.attrs.items():
+                        dst_g.attrs[k] = v
+        tmp.replace(self._h5_path)
+        print("[+] disk_desc converted to float16")
+
     def _migrate_legacy(self, legacy_index: Path) -> None:
         print("[*] Migrating legacy folder-based DB → SQLite + HDF5 + FAISS ...")
         with open(legacy_index) as f:
@@ -442,11 +516,6 @@ class BlobDB:
                                "scores":      disk_data["scores"],
                                "hw":          tuple(int(x) for x in disk_data["hw"])})
 
-                if blob_id not in self._faiss_blob_ids:
-                    self._faiss_blob_ids.append(blob_id)
-                self._faiss_add(disk_data["descriptors"],
-                                self._faiss_blob_ids.index(blob_id))
-
                 self._conn.execute(
                     "INSERT INTO images (blob_id, img_idx, source_path, kp_count, thumb_path)"
                     " VALUES (?,?,?,?,?)",
@@ -455,7 +524,7 @@ class BlobDB:
                 )
 
         self._conn.commit()
-        self._save_faiss()
+        self._rebuild_faiss()
 
         for p in self.db_dir.rglob("*_loftr.npy"):
             p.unlink(missing_ok=True)

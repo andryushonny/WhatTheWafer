@@ -1,20 +1,19 @@
 """
-wafer_id.py — Wafer blob fingerprint identification
-Using LoFTR (dense) and DISK+LightGlue (sparse) matchers.
+wafer_id.py — Wafer blob fingerprint identification (DISK + LightGlue)
 
 Commands:
   add    Add a reference image to the database
   query  Identify an unknown image
   list   List all blobs in the database
   clear  Remove a blob (or the whole DB)
+  compare Visually compare two images
 
 Examples:
-  python wafer_id.py add wafers/wafer1_1.tif --name wafer1
-  python wafer_id.py add wafers/wafer1_2.tif --name wafer1
-  python wafer_id.py add wafers/wafer2_1.tif --name wafer2
+  python wafer_id.py add wafers/wafer1_1.tif --new wafer1
+  python wafer_id.py add wafers/wafer1_2.tif --wafer wafer1
+  python wafer_id.py add wafers/wafer2_1.tif --new wafer2
   python wafer_id.py query wafers/wafer1_3.tif
-  python wafer_id.py query wafers/wafer1_3.tif --matcher loftr
-  python wafer_id.py query wafers/wafer1_3.tif --matcher both --debug
+  python wafer_id.py query wafers/wafer1_3.tif --debug
   python wafer_id.py list
   python wafer_id.py clear --name wafer1
   python wafer_id.py clear --all
@@ -108,6 +107,31 @@ def _rotate_rgb(rgb: np.ndarray, angle: float) -> np.ndarray:
     )
 
 
+# ── rotation + batch-extraction helpers ──────────────────────────────────────
+
+def _extract_cardinal_rotations(
+    disk: DISKLightGlueMatcher, gray: np.ndarray
+) -> dict[float, dict]:
+    """Extract DISK features for all 4 cardinal rotations using 2 batch forward passes.
+
+    0°+180° share spatial dimensions (H, W); 90°+270° share (W, H).
+    Two batch calls instead of four sequential calls → ~2x faster on GPU,
+    ~2x faster on CPU for the extraction stage.
+    """
+    gray_0   = gray                           # 0°  : (H, W)
+    gray_90  = _rotate_gray(gray, 90)         # 90° : (W, H)
+    gray_180 = _rotate_gray(gray, 180)        # 180°: (H, W)  same as 0°
+    gray_270 = _rotate_gray(gray, 270)        # 270°: (W, H)  same as 90°
+    f_0_180  = disk.extract_batch([gray_0, gray_180])
+    f_90_270 = disk.extract_batch([gray_90, gray_270])
+    return {
+        0.0:   f_0_180[0],
+        90.0:  f_90_270[0],
+        180.0: f_0_180[1],
+        270.0: f_90_270[1],
+    }
+
+
 # ── matching core ─────────────────────────────────────────────────────────────
 
 def run_matching(
@@ -123,17 +147,28 @@ def run_matching(
     Tries all 4 cardinal rotations of the query, then optionally searches
     ±5/10/15° around the best cardinal rotation (fine_rotation mode).
 
+    All rotation features are extracted ONCE before the candidate loop so that
+    disk.extract() is never called inside the per-blob matching logic.
+
     Returns list of (blob_id, score, best_angle_degrees) sorted descending.
     """
-    # Pre-extract features for all 4 cardinal rotations of the query
-    q_disk_by_angle = {
-        angle: disk.extract(_rotate_gray(gray_query, angle))
-        for angle in ROTATION_ANGLES
-    }
+    # Pre-extract features for all needed angles before the candidate loop.
+    # Cardinal rotations: 2 batch forward passes (0+180, 90+270) instead of 4 sequential.
+    # Fine rotations: individual calls, but only executed once here (not per-blob).
+    q_disk_by_angle: dict[float, dict] = _extract_cardinal_rotations(disk, gray_query)
+    if fine_rotation:
+        for base in ROTATION_ANGLES:
+            for offset in FINE_ROTATION_OFFSETS:
+                a = float(base + offset)
+                if a not in q_disk_by_angle:
+                    q_disk_by_angle[a] = disk.extract(_rotate_gray(gray_query, a))
 
-    # FAISS first stage: narrow to a short-list of candidates
-    q_descs_by_angle = {a: q["descriptors"] for a, q in q_disk_by_angle.items()}
-    candidate_ids = db.fast_candidates(q_descs_by_angle, top_k=FAST_TOP_K)
+    # FAISS first stage: narrow to a short-list of candidates (cardinal angles only)
+    q_descs_cardinal = {
+        a: q["descriptors"] for a, q in q_disk_by_angle.items()
+        if a in {0.0, 90.0, 180.0, 270.0}
+    }
+    candidate_ids = db.fast_candidates(q_descs_cardinal, top_k=FAST_TOP_K)
     if verbose:
         print(f"  [FAISS] candidates: {candidate_ids}")
 
@@ -144,31 +179,32 @@ def run_matching(
         best_score = 0
         best_angle = 0.0
         for i, ref in enumerate(ref_list):
-            ref_disk  = 0
-            ref_angle = 0.0
+            img_best_score = 0
+            img_best_angle = 0.0
 
+            # Cardinal search
             for angle in ROTATION_ANGLES:
-                s = disk.match(ref["disk"], q_disk_by_angle[angle])
+                s = disk.match(ref["disk"], q_disk_by_angle[float(angle)])
                 if verbose:
                     print(f"    {blob_id}[{i}]  DISK+LG@{angle:3d}°={s}")
-                if s > ref_disk:
-                    ref_disk  = s
-                    ref_angle = float(angle)
+                if s > img_best_score:
+                    img_best_score = s
+                    img_best_angle = float(angle)
 
+            # Fine-rotation search around the best cardinal (features already extracted)
             if fine_rotation:
                 for offset in FINE_ROTATION_OFFSETS:
-                    fine_angle = ref_angle + offset
-                    q_fine = disk.extract(_rotate_gray(gray_query, fine_angle))
-                    s = disk.match(ref["disk"], q_fine)
+                    fine_angle = img_best_angle + offset
+                    s = disk.match(ref["disk"], q_disk_by_angle[fine_angle])
                     if verbose:
                         print(f"    {blob_id}[{i}]  DISK+LG@{fine_angle:+.0f}°={s}")
-                    if s > ref_disk:
-                        ref_disk  = s
-                        ref_angle = fine_angle
+                    if s > img_best_score:
+                        img_best_score = s
+                        img_best_angle = fine_angle
 
-            if ref_disk > best_score:
-                best_score = ref_disk
-                best_angle = ref_angle
+            if img_best_score > best_score:
+                best_score = img_best_score
+                best_angle = img_best_angle
 
         per_blob[blob_id] = (best_score, best_angle)
 
@@ -208,42 +244,40 @@ def _print_results(
 # ── add ───────────────────────────────────────────────────────────────────────
 
 def cmd_add(args) -> None:
-    if not os.path.isfile(args.image):
-        sys.exit(f"[!] File not found: {args.image}")
+    images: list[str] = args.image   # always a list (nargs='+')
+    for p in images:
+        if not os.path.isfile(p):
+            sys.exit(f"[!] File not found: {p}")
 
     db = BlobDB(args.db)
 
     # Resolve target blob_id
     if args.wafer:
-        # --wafer UUID : add another view to an existing wafer
         blob_id = db.resolve_blob_id(args.wafer)
         if blob_id is None:
             sys.exit(f"[!] Wafer '{args.wafer}' not found. Run 'list' to see names and UUIDs.")
         adding_to_existing = True
     else:
-        # --new NAME : create a new wafer
         blob_id = args.new
         if db.get_blob(blob_id) is not None:
             existing = db.get_blob(blob_id)
             sys.exit(
                 f"[!] Wafer '{blob_id}' already exists "
                 f"(uuid:{existing['short_id']}).\n"
-                f"    To add another view use:  whattw add {args.image} --wafer {blob_id}"
+                f"    To add another view use:  whattw add {images[0]} --wafer {blob_id}"
             )
         adding_to_existing = False
 
     device = _device(getattr(args, "no_gpu", False))
     disk = _load_matcher(device)
 
-    print(f"[*] Preprocessing {args.image} ...")
-    proc = preprocess(args.image)
-    rgb, gray = proc["rgb"], proc["gray"]
-    print(f"    Cropped shape: {gray.shape[1]}×{gray.shape[0]} px")
-
-    # Duplicate-detection (only meaningful when creating a new wafer)
+    # Preprocess and optionally duplicate-check the first image before the batch
+    cached_procs: dict[str, dict] = {}
     if not adding_to_existing and db.blob_ids():
         print(f"[*] Checking against {len(db.blob_ids())} existing blob(s) ...")
-        scores = run_matching(gray, db, disk, verbose=args.debug)
+        first_proc = preprocess(images[0])
+        cached_procs[images[0]] = first_proc
+        scores = run_matching(first_proc["gray"], db, disk, verbose=args.debug)
         if scores:
             best_id, best_score, _ = scores[0]
             if best_score >= UNKNOWN_THRESHOLD:
@@ -260,12 +294,24 @@ def cmd_add(args) -> None:
                 else:
                     print("    (--force, skipping confirmation)")
 
-    idx   = db.add_image(blob_id, args.image, rgb, gray, disk)
+    # Add all images; FAISS is rebuilt once after the batch, not after each image
+    n_added = 0
+    last_idx = 0
+    with db.batch_add():
+        for img_path in images:
+            print(f"[*] Preprocessing {img_path} ...")
+            proc = cached_procs.get(img_path) or preprocess(img_path)
+            rgb, gray = proc["rgb"], proc["gray"]
+            print(f"    Cropped shape: {gray.shape[1]}×{gray.shape[0]} px")
+            last_idx = db.add_image(blob_id, img_path, rgb, gray, disk)
+            n_added += 1
+
     blob  = db.get_blob(blob_id)
     n_tot = len(blob["images"])
-    action = "Added another view to" if adding_to_existing else "Created new wafer"
+    action = "Added view(s) to" if adding_to_existing else "Created new wafer"
+    views_word = "view" if n_added == 1 else "views"
     print(f"\n[+] {action} '{blob_id}'  [UUID: {blob['short_id']}]  —  "
-          f"image #{idx}, {n_tot} view{'s' if n_tot != 1 else ''} total")
+          f"{n_added} {views_word} added, {n_tot} total")
 
 
 # ── query ─────────────────────────────────────────────────────────────────────
@@ -334,19 +380,25 @@ def cmd_compare(args) -> None:
     print(f"    {os.path.basename(args.image0):30s}  {proc0['gray'].shape[1]}×{proc0['gray'].shape[0]}")
     print(f"    {os.path.basename(args.image1):30s}  {proc1['gray'].shape[1]}×{proc1['gray'].shape[0]}")
 
-    # Rotation search: find best orientation of image1 relative to image0
+    # Rotation search: extract all 4 cardinal orientations of image1 in 2 batch
+    # forward passes, then evaluate each against image0.
     print(f"[*] Rotation search (DISK+LG) ...")
-    feats0 = disk.extract(proc0["gray"])
+    feats0         = disk.extract(proc0["gray"])
+    feats1_by_angle = _extract_cardinal_rotations(disk, proc1["gray"])
+
     best_angle = 0.0
     best_disk  = 0
+    best_feats1: dict       = feats1_by_angle[0.0]
+    best_rgb1:  np.ndarray  = proc1["rgb"]
+
     for angle in ROTATION_ANGLES:
-        gray1_rot  = _rotate_gray(proc1["gray"], angle)
-        feats1_rot = disk.extract(gray1_rot)
-        s = disk.match(feats0, feats1_rot)
+        s = disk.match(feats0, feats1_by_angle[float(angle)])
         print(f"    @{angle:3d}°  DISK+LG={s}")
         if s > best_disk:
-            best_disk  = s
-            best_angle = float(angle)
+            best_disk   = s
+            best_angle  = float(angle)
+            best_feats1 = feats1_by_angle[float(angle)]
+            best_rgb1   = _rotate_rgb(proc1["rgb"], angle)
 
     fine_rotation = getattr(args, "fine_rotation", False)
     if fine_rotation:
@@ -358,21 +410,21 @@ def cmd_compare(args) -> None:
             s = disk.match(feats0, feats1_rot)
             print(f"    @{fine_angle:+.1f}°  DISK+LG={s}")
             if s > best_disk:
-                best_disk  = s
-                best_angle = fine_angle
+                best_disk   = s
+                best_angle  = fine_angle
+                best_feats1 = feats1_rot
+                best_rgb1   = _rotate_rgb(proc1["rgb"], fine_angle)
 
     angle_msg = f"{best_angle:+.0f}°" if best_angle != 0 else "0° (no rotation)"
     print(f"    Best: {angle_msg}  (DISK+LG={best_disk})")
 
-    # Apply best rotation to image1, re-extract features
-    rgb1_rot  = _rotate_rgb(proc1["rgb"], best_angle)
-    gray1_rot = _rotate_gray(proc1["gray"], best_angle)
-    feats1    = disk.extract(gray1_rot)
+    feats1   = best_feats1
+    rgb1_rot = best_rgb1
     print(f"    kp0={len(feats0['keypoints'])}  kp1={len(feats1['keypoints'])}")
 
     print(f"[*] Building comparison visualization ...")
     from visualizer import build_comparison, DISK_THRESHOLD
-    canvas = build_comparison(
+    canvas, n_disk = build_comparison(
         proc0["rgb"], rgb1_rot,
         feats0, feats1,
         disk,
@@ -384,9 +436,7 @@ def cmd_compare(args) -> None:
     cv2.imwrite(out_path, canvas)
     print(f"[+] Saved → {out_path}  ({canvas.shape[1]}×{canvas.shape[0]} px)")
 
-    n_disk     = disk.match(feats0, feats1)
     angle_note = f"  rotation: {best_angle:+.0f}°" if best_angle != 0 else ""
-
     print()
     print(f"  DISK+LG : {n_disk:5d} inliers  "
           f"({'SAME' if n_disk >= DISK_THRESHOLD else 'diff'}, thr={DISK_THRESHOLD}){angle_note}")
@@ -465,7 +515,7 @@ def cmd_clear(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Wafer blob fingerprint identification  (LoFTR + DISK/LightGlue)",
+        description="Wafer blob fingerprint identification  (DISK + LightGlue)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -480,8 +530,9 @@ def main() -> None:
 
     # --- add ---
     p_add = sub.add_parser("add", help="Add a reference image to the DB")
-    p_add.add_argument("image",
-                       help="Path to image (TIF, JPEG, PNG, BMP)")
+    p_add.add_argument("image", nargs='+',
+                       help="Path(s) to image (TIF, JPEG, PNG, BMP); "
+                            "multiple paths add several views in one FAISS rebuild")
     add_id = p_add.add_mutually_exclusive_group(required=True)
     add_id.add_argument("--new",
                         help="Create a new wafer with this identifier, e.g. wafer1")

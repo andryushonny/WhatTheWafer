@@ -109,19 +109,21 @@ def _verdict_bar(width: int, n_disk: int,
 
 # ── RANSAC helper ─────────────────────────────────────────────────────────────
 
-def _ransac_split(kps0: np.ndarray, kps1: np.ndarray,
-                  thresh: float = 3.0) -> tuple[np.ndarray, np.ndarray, int]:
+def _ransac_split(
+    kps0: np.ndarray, kps1: np.ndarray, thresh: float = 3.0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (inlier_kps0, inlier_kps1, bool_mask) where mask indexes into kps0/kps1."""
     if len(kps0) < 4:
-        return kps0, kps1, len(kps0)
-    _, mask = cv2.findHomography(
+        return kps0, kps1, np.ones(len(kps0), dtype=bool)
+    _, raw = cv2.findHomography(
         kps0.reshape(-1, 1, 2).astype(np.float32),
         kps1.reshape(-1, 1, 2).astype(np.float32),
         cv2.RANSAC, thresh,
     )
-    if mask is None:
-        return np.empty((0, 2)), np.empty((0, 2)), 0
-    m = mask.ravel().astype(bool)
-    return kps0[m], kps1[m], int(m.sum())
+    if raw is None:
+        return np.empty((0, 2)), np.empty((0, 2)), np.zeros(len(kps0), dtype=bool)
+    m = raw.ravel().astype(bool)
+    return kps0[m], kps1[m], m
 
 
 # ── DISK+LG panel ─────────────────────────────────────────────────────────────
@@ -152,7 +154,10 @@ def _panel_disk(rgb0: np.ndarray, rgb1: np.ndarray,
     all_kps0 = feats0["keypoints"][matches[:, 0]] if len(matches) else np.empty((0, 2))
     all_kps1 = feats1["keypoints"][matches[:, 1]] if len(matches) else np.empty((0, 2))
 
-    in_kps0, in_kps1, n_in = _ransac_split(all_kps0, all_kps1)
+    in_kps0, in_kps1, inlier_mask = _ransac_split(all_kps0, all_kps1)
+    n_in = int(inlier_mask.sum())
+    non_kps0 = all_kps0[~inlier_mask]
+    non_kps1 = all_kps1[~inlier_mask]
 
     canvas, x1 = _side_by_side(rgb0, rgb1)
 
@@ -163,14 +168,6 @@ def _panel_disk(rgb0: np.ndarray, rgb1: np.ndarray,
             return a, b
         idx = rng.choice(len(a), n, replace=False)
         return a[idx], b[idx]
-
-    notin = np.ones(len(all_kps0), dtype=bool)
-    for ik0 in in_kps0:
-        hit = np.where((all_kps0 == ik0).all(axis=1))[0]
-        if len(hit):
-            notin[hit[0]] = False
-    non_kps0 = all_kps0[notin]
-    non_kps1 = all_kps1[notin]
 
     non_kps1_shifted = non_kps1.copy(); non_kps1_shifted[:, 0] += x1
     in_kps1_shifted  = in_kps1.copy();  in_kps1_shifted[:, 0] += x1
@@ -206,15 +203,15 @@ def build_comparison(
     disk_matcher,
     path0: str = "", path1: str = "",
     query_rotation: float = 0.0,
-) -> np.ndarray:
+) -> tuple[np.ndarray, int]:
     """
     Build the full comparison image (DISK panel + verdict bar).
     rgb1/feats1 should already be pre-rotated to the optimal orientation.
-    Returns a BGR numpy array ready for cv2.imwrite.
+    Returns (canvas_bgr, n_inliers) — canvas is ready for cv2.imwrite.
     """
     panel_disk, n_disk = _panel_disk(rgb0, rgb1, feats0, feats1, disk_matcher)
 
     verdict = _verdict_bar(panel_disk.shape[1], n_disk, path0, path1, query_rotation)
     sep     = np.full((3, panel_disk.shape[1], 3), (180, 180, 180), dtype=np.uint8)
 
-    return np.vstack([panel_disk, sep, verdict])
+    return np.vstack([panel_disk, sep, verdict]), n_disk

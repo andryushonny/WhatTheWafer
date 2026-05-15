@@ -19,8 +19,9 @@ RANSAC_THRESH = 3.0   # px
 class DISKLightGlueMatcher:
     name = "disk_lg"
 
-    def __init__(self, device: str = "cpu"):
+    def __init__(self, device: str = "cpu", max_keypoints: int = 2048):
         self.device = torch.device(device)
+        self.max_keypoints = max_keypoints
         self.extractor = KF.DISK.from_pretrained("depth").to(self.device).eval()
         self.matcher   = KF.LightGlue(features="disk").to(self.device).eval()
 
@@ -41,7 +42,9 @@ class DISKLightGlueMatcher:
         """
         with torch.no_grad():
             feats_list = self.extractor(
-                self._to_tensor(gray), pad_if_not_divisible=True
+                self._to_tensor(gray),
+                n=self.max_keypoints,
+                pad_if_not_divisible=True,
             )
         f = feats_list[0]   # DISKFeatures for batch item 0
         return {
@@ -50,6 +53,33 @@ class DISKLightGlueMatcher:
             "scores":      f.detection_scores.cpu().numpy().astype(np.float32),  # [N]
             "hw": (int(gray.shape[0]), int(gray.shape[1])),  # (H, W)
         }
+
+    def extract_batch(self, grays: list[np.ndarray]) -> list[dict]:
+        """Extract DISK features for a batch of same-shape images in one forward pass.
+
+        All images must have identical spatial dimensions (H, W).
+        For 90°-step rotations of a non-square image, group 0°+180° and 90°+270°
+        into separate calls since they share dimensions.
+        Falls back to sequential extraction for a single image.
+        """
+        if not grays:
+            return []
+        if len(grays) == 1:
+            return [self.extract(grays[0])]
+        batch = torch.cat([self._to_tensor(g) for g in grays], dim=0)
+        with torch.no_grad():
+            feats_list = self.extractor(
+                batch, n=self.max_keypoints, pad_if_not_divisible=True
+            )
+        return [
+            {
+                "keypoints":   f.keypoints.cpu().numpy().astype(np.float32),
+                "descriptors": f.descriptors.cpu().numpy().astype(np.float32),
+                "scores":      f.detection_scores.cpu().numpy().astype(np.float32),
+                "hw": (int(g.shape[0]), int(g.shape[1])),
+            }
+            for f, g in zip(feats_list, grays)
+        ]
 
     def match(self, feats0: dict, feats1: dict) -> int:
         """
