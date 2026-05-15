@@ -36,7 +36,6 @@ import torch
 # downloaded automatically on first run.
 _local_models = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 _bundled_weights = [
-    "checkpoints/loftr_indoor.ckpt",
     "checkpoints/depth-save.pth",
     "checkpoints/disk_lightglue_v0-1_arxiv-pth",
 ]
@@ -45,12 +44,10 @@ if all(os.path.isfile(os.path.join(_local_models, w)) for w in _bundled_weights)
 
 from preprocessing import preprocess
 from database import BlobDB
-from matchers.loftr_matcher import LoFTRMatcher
 from matchers.disk_lightglue_matcher import DISKLightGlueMatcher
 
 UNKNOWN_THRESHOLD      = 15    # min RANSAC inliers to claim a positive match
 DEFAULT_DB             = "database"
-DEFAULT_MATCHER        = "both"
 ROTATION_ANGLES        = [0, 90, 180, 270]           # coarse cardinal rotations
 FINE_ROTATION_OFFSETS  = [-15, -10, -5, 5, 10, 15]  # degrees around best coarse angle
 FAST_TOP_K             = 5    # FAISS first-stage candidate count
@@ -64,12 +61,10 @@ def _device(no_gpu: bool = False) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _load_matchers(device: str, verbose: bool = True):
+def _load_matcher(device: str, verbose: bool = True) -> DISKLightGlueMatcher:
     if verbose:
-        print(f"[*] Loading matchers on {device}...")
-    loftr = LoFTRMatcher(device=device)
-    disk  = DISKLightGlueMatcher(device=device)
-    return loftr, disk
+        print(f"[*] Loading DISK+LightGlue on {device}...")
+    return DISKLightGlueMatcher(device=device)
 
 
 # ── rotation utilities ────────────────────────────────────────────────────────
@@ -118,41 +113,29 @@ def _rotate_rgb(rgb: np.ndarray, angle: float) -> np.ndarray:
 def run_matching(
     gray_query: "np.ndarray",
     db: BlobDB,
-    loftr: LoFTRMatcher,
     disk: DISKLightGlueMatcher,
-    matcher: str = "both",
     verbose: bool = False,
     fine_rotation: bool = False,
 ) -> list[tuple[str, int, float]]:
     """
-    Match gray_query against every reference image in the DB.
+    Match gray_query against every reference image in the DB with DISK+LightGlue.
 
-    Tries all 4 cardinal rotations of the query with DISK (fast), then runs
-    LoFTR only at the best rotation found.  Fine-rotation mode additionally
-    searches ±5/10/15° around the best cardinal rotation.
+    Tries all 4 cardinal rotations of the query, then optionally searches
+    ±5/10/15° around the best cardinal rotation (fine_rotation mode).
 
     Returns list of (blob_id, score, best_angle_degrees) sorted descending.
     """
-    use_loftr = matcher in ("loftr", "both")
-    use_disk  = matcher in ("disk",  "both")
-
-    # Pre-extract DISK features for all 4 cardinal rotations of the query
-    if use_disk:
-        q_disk_by_angle = {
-            angle: disk.extract(_rotate_gray(gray_query, angle))
-            for angle in ROTATION_ANGLES
-        }
-    else:
-        q_disk_by_angle = {}
+    # Pre-extract features for all 4 cardinal rotations of the query
+    q_disk_by_angle = {
+        angle: disk.extract(_rotate_gray(gray_query, angle))
+        for angle in ROTATION_ANGLES
+    }
 
     # FAISS first stage: narrow to a short-list of candidates
-    if use_disk and q_disk_by_angle:
-        q_descs_by_angle = {a: q["descriptors"] for a, q in q_disk_by_angle.items()}
-        candidate_ids = db.fast_candidates(q_descs_by_angle, top_k=FAST_TOP_K)
-        if verbose:
-            print(f"  [FAISS] candidates: {candidate_ids}")
-    else:
-        candidate_ids = db.blob_ids()
+    q_descs_by_angle = {a: q["descriptors"] for a, q in q_disk_by_angle.items()}
+    candidate_ids = db.fast_candidates(q_descs_by_angle, top_k=FAST_TOP_K)
+    if verbose:
+        print(f"  [FAISS] candidates: {candidate_ids}")
 
     all_feats = db.load_blob_features(candidate_ids)
     per_blob: dict[str, tuple[int, float]] = {}
@@ -161,43 +144,30 @@ def run_matching(
         best_score = 0
         best_angle = 0.0
         for i, ref in enumerate(ref_list):
-            ref_angle = 0.0
             ref_disk  = 0
+            ref_angle = 0.0
 
-            # Coarse rotation search via DISK
-            if use_disk:
-                for angle in ROTATION_ANGLES:
-                    s = disk.match(ref["disk"], q_disk_by_angle[angle])
+            for angle in ROTATION_ANGLES:
+                s = disk.match(ref["disk"], q_disk_by_angle[angle])
+                if verbose:
+                    print(f"    {blob_id}[{i}]  DISK+LG@{angle:3d}°={s}")
+                if s > ref_disk:
+                    ref_disk  = s
+                    ref_angle = float(angle)
+
+            if fine_rotation:
+                for offset in FINE_ROTATION_OFFSETS:
+                    fine_angle = ref_angle + offset
+                    q_fine = disk.extract(_rotate_gray(gray_query, fine_angle))
+                    s = disk.match(ref["disk"], q_fine)
                     if verbose:
-                        print(f"    {blob_id}[{i}]  DISK+LG@{angle:3d}°={s}")
+                        print(f"    {blob_id}[{i}]  DISK+LG@{fine_angle:+.0f}°={s}")
                     if s > ref_disk:
                         ref_disk  = s
-                        ref_angle = float(angle)
+                        ref_angle = fine_angle
 
-                # Fine rotation search around best coarse angle
-                if fine_rotation:
-                    for offset in FINE_ROTATION_OFFSETS:
-                        fine_angle = ref_angle + offset
-                        q_fine = disk.extract(_rotate_gray(gray_query, fine_angle))
-                        s = disk.match(ref["disk"], q_fine)
-                        if verbose:
-                            print(f"    {blob_id}[{i}]  DISK+LG@{fine_angle:+.0f}°={s}")
-                        if s > ref_disk:
-                            ref_disk  = s
-                            ref_angle = fine_angle
-
-            score = ref_disk
-
-            # Run LoFTR at the best rotation found (avoids 4× LoFTR runs)
-            if use_loftr:
-                gray_rot = _rotate_gray(gray_query, ref_angle)
-                s_lo = loftr.match(ref["loftr"]["gray"], gray_rot)
-                if verbose:
-                    print(f"    {blob_id}[{i}]  LoFTR@{ref_angle:.0f}°={s_lo}")
-                score = max(score, s_lo)
-
-            if score > best_score:
-                best_score = score
+            if ref_disk > best_score:
+                best_score = ref_disk
                 best_angle = ref_angle
 
         per_blob[blob_id] = (best_score, best_angle)
@@ -263,7 +233,7 @@ def cmd_add(args) -> None:
         adding_to_existing = False
 
     device = _device(getattr(args, "no_gpu", False))
-    loftr, disk = _load_matchers(device)
+    disk = _load_matcher(device)
 
     print(f"[*] Preprocessing {args.image} ...")
     proc = preprocess(args.image)
@@ -273,8 +243,7 @@ def cmd_add(args) -> None:
     # Duplicate-detection (only meaningful when creating a new wafer)
     if not adding_to_existing and db.blob_ids():
         print(f"[*] Checking against {len(db.blob_ids())} existing blob(s) ...")
-        scores = run_matching(gray, db, loftr, disk,
-                              matcher=args.matcher, verbose=args.debug)
+        scores = run_matching(gray, db, disk, verbose=args.debug)
         if scores:
             best_id, best_score, _ = scores[0]
             if best_score >= UNKNOWN_THRESHOLD:
@@ -291,7 +260,7 @@ def cmd_add(args) -> None:
                 else:
                     print("    (--force, skipping confirmation)")
 
-    idx   = db.add_image(blob_id, args.image, rgb, gray, loftr, disk)
+    idx   = db.add_image(blob_id, args.image, rgb, gray, disk)
     blob  = db.get_blob(blob_id)
     n_tot = len(blob["images"])
     action = "Added another view to" if adding_to_existing else "Created new wafer"
@@ -310,19 +279,17 @@ def cmd_query(args) -> None:
         sys.exit("[!] Database is empty. Run 'add' first.")
 
     device = _device(getattr(args, "no_gpu", False))
-    loftr, disk = _load_matchers(device)
+    disk = _load_matcher(device)
 
     print(f"[*] Preprocessing {args.image} ...")
     proc = preprocess(args.image)
     gray = proc["gray"]
     print(f"    Cropped shape: {gray.shape[1]}×{gray.shape[0]} px")
-    print(f"[*] Matching against {len(db.blob_ids())} blob(s) "
-          f"(matcher={args.matcher}) ...")
+    print(f"[*] Matching against {len(db.blob_ids())} blob(s) ...")
 
     verbose = getattr(args, "debug", False)
     fine_rotation = getattr(args, "fine_rotation", False)
-    scores = run_matching(gray, db, loftr, disk,
-                          matcher=args.matcher, verbose=verbose,
+    scores = run_matching(gray, db, disk, verbose=verbose,
                           fine_rotation=fine_rotation)
     _print_results(scores, top_k=args.top_k, threshold=args.threshold)
 
@@ -359,7 +326,7 @@ def cmd_compare(args) -> None:
             sys.exit(f"[!] File not found: {p}")
 
     device = _device(getattr(args, "no_gpu", False))
-    loftr, disk = _load_matchers(device)
+    disk = _load_matcher(device)
 
     print(f"[*] Preprocessing ...")
     proc0 = preprocess(args.image0)
@@ -373,7 +340,7 @@ def cmd_compare(args) -> None:
     best_angle = 0.0
     best_disk  = 0
     for angle in ROTATION_ANGLES:
-        gray1_rot = _rotate_gray(proc1["gray"], angle)
+        gray1_rot  = _rotate_gray(proc1["gray"], angle)
         feats1_rot = disk.extract(gray1_rot)
         s = disk.match(feats0, feats1_rot)
         print(f"    @{angle:3d}°  DISK+LG={s}")
@@ -404,12 +371,11 @@ def cmd_compare(args) -> None:
     print(f"    kp0={len(feats0['keypoints'])}  kp1={len(feats1['keypoints'])}")
 
     print(f"[*] Building comparison visualization ...")
-    from visualizer import build_comparison, DISK_THRESHOLD, LOFTR_THRESHOLD
+    from visualizer import build_comparison, DISK_THRESHOLD
     canvas = build_comparison(
         proc0["rgb"], rgb1_rot,
-        proc0["gray"], gray1_rot,
         feats0, feats1,
-        loftr, disk,
+        disk,
         path0=args.image0, path1=args.image1,
         query_rotation=best_angle,
     )
@@ -418,18 +384,14 @@ def cmd_compare(args) -> None:
     cv2.imwrite(out_path, canvas)
     print(f"[+] Saved → {out_path}  ({canvas.shape[1]}×{canvas.shape[0]} px)")
 
-    # Text verdict
-    n_disk  = disk.match(feats0, feats1)
-    n_loftr = loftr.match(proc0["gray"], gray1_rot)
+    n_disk     = disk.match(feats0, feats1)
     angle_note = f"  rotation: {best_angle:+.0f}°" if best_angle != 0 else ""
 
     print()
     print(f"  DISK+LG : {n_disk:5d} inliers  "
-          f"({'SAME' if n_disk  >= DISK_THRESHOLD  else 'diff'}, thr={DISK_THRESHOLD}){angle_note}")
-    print(f"  LoFTR   : {n_loftr:5d} inliers  "
-          f"({'SAME' if n_loftr >= LOFTR_THRESHOLD else 'diff'}, thr={LOFTR_THRESHOLD})")
+          f"({'SAME' if n_disk >= DISK_THRESHOLD else 'diff'}, thr={DISK_THRESHOLD}){angle_note}")
     print()
-    if n_disk >= DISK_THRESHOLD or n_loftr >= LOFTR_THRESHOLD:
+    if n_disk >= DISK_THRESHOLD:
         print(f"[✓] SAME BLOB")
     else:
         print(f"[✗] DIFFERENT")
@@ -527,17 +489,11 @@ def main() -> None:
                         help="Wafer name or 4-char UUID of existing wafer to add a new view to")
     p_add.add_argument("--force", action="store_true",
                        help="Skip duplicate-detection warning")
-    p_add.add_argument("--matcher", default="disk",
-                       choices=["loftr", "disk", "both"],
-                       help="Matcher for duplicate check  (default: disk)")
 
     # --- query ---
     p_query = sub.add_parser("query", help="Identify an unknown image")
     p_query.add_argument("image",
                          help="Path to query image (TIF, JPEG, PNG, BMP)")
-    p_query.add_argument("--matcher", default=DEFAULT_MATCHER,
-                         choices=["loftr", "disk", "both"],
-                         help=f"Matcher to use  (default: {DEFAULT_MATCHER})")
     p_query.add_argument("--top-k", type=int, default=5,
                          help="Number of ranked results to show  (default: 5)")
     p_query.add_argument("--threshold", type=int, default=UNKNOWN_THRESHOLD,

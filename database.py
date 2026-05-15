@@ -52,6 +52,9 @@ class BlobDB:
         if legacy.exists():
             self._migrate_legacy(legacy)
 
+        # One-shot migration: strip loftr_gray from existing HDF5 data
+        self._migrate_strip_loftr()
+
     # ── SQLite ────────────────────────────────────────────────────────────────
 
     def _init_sqlite(self) -> sqlite3.Connection:
@@ -159,11 +162,9 @@ class BlobDB:
     def _h5_key(blob_id: str, img_idx: int) -> str:
         return f"blobs/{blob_id}/{img_idx:03d}"
 
-    def _h5_save(self, blob_id: str, img_idx: int,
-                 loftr_feats: dict, disk_feats: dict) -> None:
+    def _h5_save(self, blob_id: str, img_idx: int, disk_feats: dict) -> None:
         with h5py.File(str(self._h5_path), "a") as f:
             g = f.require_group(self._h5_key(blob_id, img_idx))
-            g.create_dataset("loftr_gray",  data=loftr_feats["gray"],      compression="lzf")
             g.create_dataset("disk_kp",     data=disk_feats["keypoints"])
             g.create_dataset("disk_desc",   data=disk_feats["descriptors"], compression="lzf")
             g.create_dataset("disk_scores", data=disk_feats["scores"])
@@ -176,8 +177,7 @@ class BlobDB:
                 raise KeyError(f"Features not found in HDF5: {key}")
             g = f[key]
             return {
-                "loftr": {"gray": g["loftr_gray"][:]},
-                "disk":  {
+                "disk": {
                     "keypoints":   g["disk_kp"][:],
                     "descriptors": g["disk_desc"][:],
                     "scores":      g["disk_scores"][:],
@@ -262,7 +262,6 @@ class BlobDB:
         source_path: str,
         rgb: np.ndarray,
         gray: np.ndarray,
-        loftr_matcher,
         disk_matcher,
     ) -> int:
         n = self._conn.execute(
@@ -284,10 +283,9 @@ class BlobDB:
         else:
             thumb_path = None
 
-        loftr_feats = loftr_matcher.extract(gray)
-        disk_feats  = disk_matcher.extract(gray)
+        disk_feats = disk_matcher.extract(gray)
 
-        self._h5_save(blob_id, n, loftr_feats, disk_feats)
+        self._h5_save(blob_id, n, disk_feats)
 
         if blob_id not in self._faiss_blob_ids:
             blob_idx = len(self._faiss_blob_ids)
@@ -388,7 +386,35 @@ class BlobDB:
     def load_all_features(self) -> dict:
         return self.load_blob_features(self.blob_ids())
 
-    # ── legacy migration ──────────────────────────────────────────────────────
+    # ── migrations ────────────────────────────────────────────────────────────
+
+    def _migrate_strip_loftr(self) -> None:
+        """Remove loftr_gray datasets from existing HDF5 data and compact the file."""
+        if not self._h5_path.exists():
+            return
+        with h5py.File(str(self._h5_path), "r") as f:
+            has_loftr = any(
+                "loftr_gray" in f[f"blobs/{bid}/{ikey}"]
+                for bid in f.get("blobs", {})
+                for ikey in f["blobs"][bid]
+            )
+        if not has_loftr:
+            return
+        print("[*] Migrating DB: removing LoFTR data from features.h5 ...")
+        tmp = self._h5_path.with_suffix(".h5.tmp")
+        with h5py.File(str(self._h5_path), "r") as src, \
+             h5py.File(str(tmp), "w") as dst:
+            for blob_id in src.get("blobs", {}).keys():
+                for img_key in src["blobs"][blob_id].keys():
+                    src_g = src[f"blobs/{blob_id}/{img_key}"]
+                    dst_g = dst.require_group(f"blobs/{blob_id}/{img_key}")
+                    for key in src_g.keys():
+                        if key != "loftr_gray":
+                            src.copy(f"blobs/{blob_id}/{img_key}/{key}", dst_g, name=key)
+                    for k, v in src_g.attrs.items():
+                        dst_g.attrs[k] = v
+        tmp.replace(self._h5_path)
+        print("[+] LoFTR data removed from features.h5")
 
     def _migrate_legacy(self, legacy_index: Path) -> None:
         print("[*] Migrating legacy folder-based DB → SQLite + HDF5 + FAISS ...")
@@ -402,18 +428,15 @@ class BlobDB:
                  blob.get("added_at", _now_iso())),
             )
             for img in blob.get("images", []):
-                lp = img.get("loftr_path", "")
-                dp = img.get("disk_path",  "")
-                if not (lp and dp and Path(lp).exists() and Path(dp).exists()):
+                dp = img.get("disk_path", "")
+                if not (dp and Path(dp).exists()):
                     continue
-                loftr_gray = np.load(lp)
-                disk_data  = np.load(dp)
+                disk_data = np.load(dp)
                 n = self._conn.execute(
                     "SELECT COUNT(*) FROM images WHERE blob_id=?", (blob_id,)
                 ).fetchone()[0]
 
                 self._h5_save(blob_id, n,
-                              {"gray": loftr_gray},
                               {"keypoints":   disk_data["keypoints"],
                                "descriptors": disk_data["descriptors"],
                                "scores":      disk_data["scores"],
